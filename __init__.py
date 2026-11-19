@@ -1,4 +1,4 @@
-"""Capture one macOS native flamegraph and Python profile per queued prompt."""
+"""Capture one native flamegraph and Python profile per queued prompt."""
 
 from contextvars import ContextVar
 import cProfile
@@ -7,6 +7,7 @@ from html import escape
 import logging
 import os
 from pathlib import Path
+import platform
 import re
 import select
 import signal
@@ -23,38 +24,18 @@ import torch
 
 log = logging.getLogger(__name__)
 FRAME = re.compile(r"^([ +|!:\t]*)(\d+) (.+)$")
+PERF_FRAME = re.compile(r"^\s+[0-9a-fA-F]+\s+(.+?)(?:\s+\(|$)")
 
 node_timings = ContextVar("flamegraph_node_timings", default=None)
 
 
-def write_flamegraph(report, output, timings):
-    call_graph = report.split("Call graph:\n", 1)[1].split("\n\n", 1)[0]
-    frames = []
-    parents = []
-    root_width = 0
-    for line in call_graph.splitlines():
-        match = FRAME.match(line)
-        if not match:
-            continue
-        indent, count, label = match.groups()
-        count = int(count)
-        while parents and parents[-1][0] >= len(indent):
-            parents.pop()
-        if parents:
-            parent = parents[-1]
-            left = parent[1] + parent[2]
-            parent[2] += count
-        else:
-            left = root_width
-            root_width += count
-        depth = len(parents)
-        parents.append([len(indent), left, 0])
-        label = re.sub(r" \+ \d.*$", "", label)
-        frames.append((left, count, depth, label))
+def frames_to_svg(frames, root_width, output, timings):
     if not root_width:
-        raise ValueError("macOS sample report contains no call stacks")
+        raise ValueError("Native profile contains no call stacks")
+
+    max_depth = max(frame[2] for frame in frames)
     width = 1400
-    height = 85 + len(timings) * 18 + (1 + max(frame[2] for frame in frames)) * 20
+    height = 85 + len(timings) * 18 + (1 + max_depth) * 20
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
         '<rect width="100%" height="100%" fill="#fffaf2"/>',
@@ -78,13 +59,66 @@ def write_flamegraph(report, output, timings):
         )
         if w >= 21:
             limit = int((w - 6) / 6.6)
-            displayed = label if len(label) <= limit else label[:limit - 1] + "…"
+            displayed = label if len(label) <= limit else label[:limit - 1] + "..."
             svg.append(f'<text x="{x + 3:.3f}" y="{y + 13}" font-family="monospace" font-size="11">{escape(displayed)}</text>')
         svg.append("</g>")
     output.write_text("\n".join([*svg, "</svg>"]), encoding="utf-8")
 
 
-def start_sample(report):
+def write_macos_flamegraph(report, output, timings):
+    call_graph = report.split("Call graph:\n", 1)[1].split("\n\n", 1)[0]
+    frames = []
+    parents = []
+    root_width = 0
+    for line in call_graph.splitlines():
+        match = FRAME.match(line)
+        if not match:
+            continue
+        indent, count, label = match.groups()
+        count = int(count)
+        while parents and parents[-1][0] >= len(indent):
+            parents.pop()
+        if parents:
+            parent = parents[-1]
+            left = parent[1] + parent[2]
+            parent[2] += count
+        else:
+            left = root_width
+            root_width += count
+        depth = len(parents)
+        parents.append([len(indent), left, 0])
+        label = re.sub(r" \+ \d.*$", "", label)
+        frames.append((left, count, depth, label))
+    frames_to_svg(frames, root_width, output, timings)
+
+
+def write_linux_flamegraph(report, output, timings):
+    folded = {}
+    stack = []
+    for line in report.splitlines():
+        if not line.strip():
+            if stack:
+                folded[tuple(reversed(stack))] = folded.get(tuple(reversed(stack)), 0) + 1
+                stack = []
+            continue
+        match = PERF_FRAME.match(line)
+        if match:
+            label = re.sub(r"\+0x[0-9a-fA-F]+$", "", match.group(1).strip())
+            stack.append(label)
+    if stack:
+        folded[tuple(reversed(stack))] = folded.get(tuple(reversed(stack)), 0) + 1
+
+    frames = []
+    root_width = 0
+    for stack, count in sorted(folded.items()):
+        left = root_width
+        root_width += count
+        for depth, label in enumerate(stack):
+            frames.append((left, count, depth, label))
+    frames_to_svg(frames, root_width, output, timings)
+
+
+def start_macos_sample(report):
     process = subprocess.Popen(
         ["/usr/bin/sample", str(os.getpid()), "86400", "2", "-file", str(report)],
         stdout=subprocess.DEVNULL,
@@ -102,7 +136,7 @@ def start_sample(report):
     return None
 
 
-def finish_sample(process, report, timings):
+def finish_macos_sample(process, report, timings):
     if process.poll() is None:
         process.send_signal(signal.SIGINT)
     try:
@@ -114,8 +148,84 @@ def finish_sample(process, report, timings):
     if process.returncode or not report.is_file():
         raise RuntimeError(stderr.decode(errors="replace").strip())
     graph = report.with_suffix(".svg")
-    write_flamegraph(report.read_text(encoding="utf-8", errors="replace"), graph, timings)
+    write_macos_flamegraph(report.read_text(encoding="utf-8", errors="replace"), graph, timings)
     return graph
+
+
+def start_linux_perf(report):
+    data = report.with_suffix(".perf.data")
+    return subprocess.Popen(
+        [
+            "perf",
+            "record",
+            "-F",
+            "99",
+            "-g",
+            "--call-graph",
+            "dwarf",
+            "-p",
+            str(os.getpid()),
+            "-o",
+            str(data),
+            "--",
+            "sleep",
+            "86400",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+
+def finish_linux_perf(process, report, timings):
+    if process.poll() is None:
+        process.send_signal(signal.SIGINT)
+    try:
+        _, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    data = report.with_suffix(".perf.data")
+    if process.returncode or not data.is_file():
+        raise RuntimeError(stderr.decode(errors="replace").strip())
+
+    script = subprocess.run(
+        ["perf", "script", "-i", str(data)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if script.returncode:
+        raise RuntimeError(script.stderr.strip())
+
+    report.write_text(script.stdout, encoding="utf-8")
+    graph = report.with_suffix(".svg")
+    write_linux_flamegraph(script.stdout, graph, timings)
+    return graph
+
+
+def start_native_profile(report):
+    system = platform.system()
+    if system == "Darwin":
+        process = start_macos_sample(report)
+        if process is None:
+            return None
+        return ("macos-sample", process)
+    if system == "Linux":
+        return ("linux-perf", start_linux_perf(report))
+    log.warning("Native profiler is not supported on %s", system)
+    return None
+
+
+def finish_native_profile(native_profile, report, timings):
+    kind, process = native_profile
+    if kind == "macos-sample":
+        return finish_macos_sample(process, report, timings)
+    if kind == "linux-perf":
+        return finish_linux_perf(process, report, timings)
+    raise RuntimeError(f"Unknown native profiler {kind}")
 
 
 def install():
@@ -160,7 +270,7 @@ def install():
             stem = directory / f"{prefix}-{uuid4().hex}"
             report = stem.with_suffix(".txt")
             log.info("Profiling prompt %s in %s", prompt_id, stem)
-            process = start_sample(report)
+            native_profile = start_native_profile(report)
         except Exception:
             log.exception("Could not initialize prompt profiling")
             return original(self, prompt, prompt_id, extra_data, execute_outputs)
@@ -173,8 +283,8 @@ def install():
         finally:
             node_timings.reset(token)
             try:
-                if process is not None:
-                    graph = finish_sample(process, report, timings)
+                if native_profile is not None:
+                    graph = finish_native_profile(native_profile, report, timings)
                     artifact = {
                         "filename": graph.name,
                         "download_url": f"/run-flamegraph/{graph.name}",
