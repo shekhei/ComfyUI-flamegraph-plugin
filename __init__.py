@@ -1,231 +1,86 @@
-"""Capture one native flamegraph and Python profile per queued prompt."""
+"""Capture one pyinstrument HTML profile per queued prompt."""
 
 from contextvars import ContextVar
-import cProfile
 from functools import wraps
-from html import escape
 import logging
-import os
 from pathlib import Path
-import platform
 import re
-import select
-import signal
-import subprocess
 from time import monotonic
 from uuid import uuid4
 
-from aiohttp import web
-
 import execution
 import folder_paths
-from server import PromptServer
+from comfy.comfy_types.node_typing import IO
 import torch
 
 log = logging.getLogger(__name__)
-FRAME = re.compile(r"^([ +|!:\t]*)(\d+) (.+)$")
-PERF_FRAME = re.compile(r"^\s+[0-9a-fA-F]+\s+(.+?)(?:\s+\(|$)")
 
 node_timings = ContextVar("flamegraph_node_timings", default=None)
 
 
-def frames_to_svg(frames, root_width, output, timings):
-    if not root_width:
-        raise ValueError("Native profile contains no call stacks")
+def start_python_profile(prompt_id):
+    from pyinstrument import Profiler
 
-    max_depth = max(frame[2] for frame in frames)
-    width = 1400
-    height = 85 + len(timings) * 18 + (1 + max_depth) * 20
-    svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
-        '<rect width="100%" height="100%" fill="#fffaf2"/>',
-        '<text x="12" y="24" font-family="sans-serif">Workflow node execution · elapsed wall time</text>',
+    profiler = Profiler(async_mode="enabled")
+    profiler.start(target_description=f"ComfyUI prompt {prompt_id}")
+    return profiler
+
+
+def write_pyinstrument_profile_html(session, output):
+    from pyinstrument import renderers
+
+    with open(output, "w") as f:
+        f.write(renderers.HTMLRenderer(timeline=True, show_all=True).render(session))
+    return output
+
+def write_pyinstrument_profile_speedscope(session, output):
+    from pyinstrument import renderers
+
+    with open(output, "w") as f:
+        f.write(renderers.SpeedscopeRenderer(timeline=True, show_all=True).render(session))
+    return output
+
+
+def flamegraph_output_node_ids(prompt):
+    return [
+        str(node_id)
+        for node_id, node in prompt.items()
+        if node.get("class_type") == "RunFlamegraphOutput"
     ]
-    for row, (node_id, class_type, seconds) in enumerate(timings):
-        label = escape(f"{node_id}  {class_type}  {seconds * 1000:,.1f} ms")
-        svg.append(f'<text x="12" y="{44 + row * 18}" font-family="monospace" font-size="13">{label}</text>')
-    svg.append(
-        f'<text x="12" y="{50 + len(timings) * 18}" font-family="sans-serif">'
-        f'Native stacks · {root_width:,} thread samples · hover for details</text>'
-    )
-    for left, count, depth, label in frames:
-        x = left * width / root_width
-        w = count * width / root_width
-        y = height - 22 - depth * 20
-        hue = 12 + sum(map(ord, label)) % 35
-        svg.append(
-            f'<g><title>{escape(label)} ({count:,} samples)</title>'
-            f'<rect x="{x:.3f}" y="{y}" width="{w:.3f}" height="19" fill="hsl({hue},80%,66%)" stroke="#fffaf2" stroke-width=".35"/>'
-        )
-        if w >= 21:
-            limit = int((w - 6) / 6.6)
-            displayed = label if len(label) <= limit else label[:limit - 1] + "..."
-            svg.append(f'<text x="{x + 3:.3f}" y="{y + 13}" font-family="monospace" font-size="11">{escape(displayed)}</text>')
-        svg.append("</g>")
-    output.write_text("\n".join([*svg, "</svg>"]), encoding="utf-8")
 
 
-def write_macos_flamegraph(report, output, timings):
-    call_graph = report.split("Call graph:\n", 1)[1].split("\n\n", 1)[0]
-    frames = []
-    parents = []
-    root_width = 0
-    for line in call_graph.splitlines():
-        match = FRAME.match(line)
-        if not match:
-            continue
-        indent, count, label = match.groups()
-        count = int(count)
-        while parents and parents[-1][0] >= len(indent):
-            parents.pop()
-        if parents:
-            parent = parents[-1]
-            left = parent[1] + parent[2]
-            parent[2] += count
-        else:
-            left = root_width
-            root_width += count
-        depth = len(parents)
-        parents.append([len(indent), left, 0])
-        label = re.sub(r" \+ \d.*$", "", label)
-        frames.append((left, count, depth, label))
-    frames_to_svg(frames, root_width, output, timings)
+def make_artifacts(profile, profile_speedscope, torch_trace=None):
+    artifact_html = {
+        "filename": profile.name,
+        "profile_kind": "python",
+    }
+    artifact_speedscope = {
+        "filename": profile_speedscope.name,
+        "profile_kind": "speedscope",
+    }
+    output_artifacts = [
+        {**artifact_html, "type": "output", "subfolder": "profiles"},
+        {**artifact_speedscope, "type": "output", "subfolder": "profiles"},
+    ]
+    if torch_trace is not None:
+        output_artifacts.append({
+            "filename": torch_trace.name,
+            "profile_kind": "torch",
+            "type": "output",
+            "subfolder": "profiles",
+        })
+    return artifact_html, artifact_speedscope, output_artifacts
 
 
-def write_linux_flamegraph(report, output, timings):
-    folded = {}
-    stack = []
-    for line in report.splitlines():
-        if not line.strip():
-            if stack:
-                folded[tuple(reversed(stack))] = folded.get(tuple(reversed(stack)), 0) + 1
-                stack = []
-            continue
-        match = PERF_FRAME.match(line)
-        if match:
-            label = re.sub(r"\+0x[0-9a-fA-F]+$", "", match.group(1).strip())
-            stack.append(label)
-    if stack:
-        folded[tuple(reversed(stack))] = folded.get(tuple(reversed(stack)), 0) + 1
+def start_torch_profile(prompt_id):
+    from torch.profiler import ProfilerActivity, profile
 
-    frames = []
-    root_width = 0
-    for stack, count in sorted(folded.items()):
-        left = root_width
-        root_width += count
-        for depth, label in enumerate(stack):
-            frames.append((left, count, depth, label))
-    frames_to_svg(frames, root_width, output, timings)
-
-
-def start_macos_sample(report):
-    process = subprocess.Popen(
-        ["/usr/bin/sample", str(os.getpid()), "86400", "2", "-file", str(report)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    if select.select([process.stderr], [], [], 5)[0]:
-        status = process.stderr.readline().decode(errors="replace")
-        if status.startswith("Sampling process "):
-            return process
-        log.warning("Native profiler could not attach: %s", status.strip())
-    else:
-        log.warning("Native profiler did not start within five seconds")
-    process.kill()
-    process.communicate()
-    return None
-
-
-def finish_macos_sample(process, report, timings):
-    if process.poll() is None:
-        process.send_signal(signal.SIGINT)
-    try:
-        _, stderr = process.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        raise
-    if process.returncode or not report.is_file():
-        raise RuntimeError(stderr.decode(errors="replace").strip())
-    graph = report.with_suffix(".svg")
-    write_macos_flamegraph(report.read_text(encoding="utf-8", errors="replace"), graph, timings)
-    return graph
-
-
-def start_linux_perf(report):
-    data = report.with_suffix(".perf.data")
-    return subprocess.Popen(
-        [
-            "perf",
-            "record",
-            "-F",
-            "99",
-            "-g",
-            "--call-graph",
-            "dwarf",
-            "-p",
-            str(os.getpid()),
-            "-o",
-            str(data),
-            "--",
-            "sleep",
-            "86400",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-
-
-def finish_linux_perf(process, report, timings):
-    if process.poll() is None:
-        process.send_signal(signal.SIGINT)
-    try:
-        _, stderr = process.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        raise
-    data = report.with_suffix(".perf.data")
-    if process.returncode or not data.is_file():
-        raise RuntimeError(stderr.decode(errors="replace").strip())
-
-    script = subprocess.run(
-        ["perf", "script", "-i", str(data)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    if script.returncode:
-        raise RuntimeError(script.stderr.strip())
-
-    report.write_text(script.stdout, encoding="utf-8")
-    graph = report.with_suffix(".svg")
-    write_linux_flamegraph(script.stdout, graph, timings)
-    return graph
-
-
-def start_native_profile(report):
-    system = platform.system()
-    if system == "Darwin":
-        process = start_macos_sample(report)
-        if process is None:
-            return None
-        return ("macos-sample", process)
-    if system == "Linux":
-        return ("linux-perf", start_linux_perf(report))
-    log.warning("Native profiler is not supported on %s", system)
-    return None
-
-
-def finish_native_profile(native_profile, report, timings):
-    kind, process = native_profile
-    if kind == "macos-sample":
-        return finish_macos_sample(process, report, timings)
-    if kind == "linux-perf":
-        return finish_linux_perf(process, report, timings)
-    raise RuntimeError(f"Unknown native profiler {kind}")
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+    profiler = profile(activities=activities, record_shapes=True, profile_memory=True)
+    profiler.__enter__()
+    return profiler
 
 
 def install():
@@ -259,6 +114,8 @@ def install():
         if settings.get("enabled") is not True:
             return original(self, prompt, prompt_id, extra_data, execute_outputs)
 
+        torch_enabled = settings.get("torch_enabled") is True
+
         prefix = settings.get("prefix")
         prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", prefix[:48]).strip("-_") if isinstance(prefix, str) else ""
         prefix = prefix or "flamegraph"
@@ -268,36 +125,39 @@ def install():
             directory.mkdir(parents=True, exist_ok=True)
             # Use a generated suffix even if a caller reuses a prompt ID.
             stem = directory / f"{prefix}-{uuid4().hex}"
-            report = stem.with_suffix(".txt")
             log.info("Profiling prompt %s in %s", prompt_id, stem)
-            native_profile = start_native_profile(report)
+            python_profile = start_python_profile(prompt_id)
+            torch_profile = start_torch_profile(prompt_id) if torch_enabled else None
         except Exception:
             log.exception("Could not initialize prompt profiling")
             return original(self, prompt, prompt_id, extra_data, execute_outputs)
 
-        python_profile = cProfile.Profile()
         timings = []
         token = node_timings.set(timings)
         try:
-            return python_profile.runcall(original, self, prompt, prompt_id, extra_data, execute_outputs)
+            return original(self, prompt, prompt_id, extra_data, execute_outputs)
         finally:
             node_timings.reset(token)
             try:
-                if native_profile is not None:
-                    graph = finish_native_profile(native_profile, report, timings)
-                    artifact = {
-                        "filename": graph.name,
-                        "download_url": f"/run-flamegraph/{graph.name}",
-                    }
-                    self.history_result["flamegraph"] = artifact
-                    self.history_result["outputs"]["run_flamegraph"] = {
-                        "flamegraphs": [{**artifact, "type": "output", "subfolder": "profiles"}],
-                    }
+                python_profile.stop()
+                torch_trace = None
+                if torch_profile is not None:
+                    torch_profile.__exit__(None, None, None)
+                    torch_trace = stem.with_name(f"{stem.name}-torch.json")
+                    torch_profile.export_chrome_trace(str(torch_trace))
+                last_session = python_profile.last_session
+                profile = write_pyinstrument_profile_html(python_profile.last_session, stem.with_suffix(".html"))
+                profile_speedscope = write_pyinstrument_profile_speedscope(last_session, stem.with_suffix(".json"))
+                artifact_html, artifact_speedscope, output_artifacts = make_artifacts(profile, profile_speedscope, torch_trace)
 
-            except Exception:
-                log.exception("Could not save native profile for prompt %s", prompt_id)
-            try:
-                python_profile.dump_stats(stem.with_suffix(".pstats"))
+                self.history_result["flamegraph"] = artifact_html
+                self.history_result["flamegraph.speedscope"] = artifact_speedscope
+                output_node_ids = flamegraph_output_node_ids(prompt)
+                if not output_node_ids:
+                    output_node_ids = ["profile.html_report"]
+                for node_id in output_node_ids:
+                    self.history_result["outputs"][node_id] = {"flamegraphs": output_artifacts}
+
             except Exception:
                 log.exception("Could not save Python profile for prompt %s", prompt_id)
 
@@ -325,6 +185,37 @@ class RunFlamegraph:
         return ()
 
 
+class RunFlamegraphOutput:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "anything": (IO.ANY, {"forceInput": True}),
+            }
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return True
+
+    RETURN_TYPES = (IO.ANY,)
+    RETURN_NAMES = ("anything",)
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "profiling"
+
+    def run(self, anything):
+        return {
+            "ui": {
+                "flamegraphs": [{
+                    "filename": "Profile will be attached when the workflow finishes.",
+                    "profile_kind": "pending",
+                }]
+            },
+            "result": (anything,),
+        }
+
+
 class NativeProfileSmokeTest:
     @classmethod
     def INPUT_TYPES(cls):
@@ -347,23 +238,15 @@ class NativeProfileSmokeTest:
         return ()
 
 
-@PromptServer.instance.routes.get("/run-flamegraph/{filename:(?:[A-Za-z0-9_-]{1,48}-)?[0-9a-f]{32}\\.svg}")
-async def download_flamegraph(request):
-    filename = request.match_info["filename"]
-    graph = Path(folder_paths.get_output_directory()) / "profiles" / filename
-    if not graph.is_file():
-        raise web.HTTPNotFound()
-    return web.FileResponse(
-        graph,
-        headers={
-            "Content-Type": "image/svg+xml",
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Security-Policy": "sandbox; default-src 'none'",
-        },
-    )
-
-
 WEB_DIRECTORY = "web"
 install()
-NODE_CLASS_MAPPINGS = {"NativeProfileSmokeTest": NativeProfileSmokeTest, "RunFlamegraph": RunFlamegraph}
-NODE_DISPLAY_NAME_MAPPINGS = {"NativeProfileSmokeTest": "Native Profile Smoke Test", "RunFlamegraph": "Run Flamegraph"}
+NODE_CLASS_MAPPINGS = {
+    "NativeProfileSmokeTest": NativeProfileSmokeTest,
+    "RunFlamegraph": RunFlamegraph,
+    "RunFlamegraphOutput": RunFlamegraphOutput,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "NativeProfileSmokeTest": "Native Profile Smoke Test",
+    "RunFlamegraph": "Run Flamegraph",
+    "RunFlamegraphOutput": "Run Flamegraph Output",
+}

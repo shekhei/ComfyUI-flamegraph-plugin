@@ -29,6 +29,12 @@ app.registerExtension({
         const enabledLabel = document.createElement("label");
         enabledLabel.append(enabled, " Enable profiling");
 
+        const torchEnabled = document.createElement("input");
+        torchEnabled.type = "checkbox";
+        torchEnabled.checked = saved.torch_enabled === true;
+        const torchLabel = document.createElement("label");
+        torchLabel.append(torchEnabled, " Enable Torch profiler");
+
         const prefix = document.createElement("input");
         prefix.type = "text";
         prefix.maxLength = 48;
@@ -38,11 +44,11 @@ app.registerExtension({
         prefixLabel.style.cssText = "display:grid;gap:4px";
         prefixLabel.append("Filename prefix", prefix);
 
-        form.append(enabledLabel, prefixLabel);
+        form.append(enabledLabel, torchLabel, prefixLabel);
         panel.append(heading, form);
         document.body.append(panel);
 
-        const settings = () => ({ enabled: enabled.checked, prefix: prefix.value });
+        const settings = () => ({ enabled: enabled.checked, torch_enabled: torchEnabled.checked, prefix: prefix.value });
         const save = () => {
             try {
                 localStorage.setItem(storageKey, JSON.stringify(settings()));
@@ -51,6 +57,7 @@ app.registerExtension({
             }
         };
         enabled.addEventListener("change", save);
+        torchEnabled.addEventListener("change", save);
         prefix.addEventListener("input", save);
 
         const fetchApi = api.fetchApi.bind(api);
